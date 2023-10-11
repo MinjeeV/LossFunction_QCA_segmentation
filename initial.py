@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument('--fold', type=int, default= 0)
     
     parser.add_argument('--batch_size', type=int, default=12)
-    parser.add_argument('--epochs', type=int, default=400)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--use_fp16', type=int, default=0,
                 help='Use mixed precision method: set a number of iters_to_accumulate')
     

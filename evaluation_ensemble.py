@@ -138,7 +138,7 @@ def load_model(m, param_path):
                      in_channels=1, classes=3)
     
     model.load_state_dict(torch.load(param_path+m))
-    return model
+    return model_name, model
 
 def make_config(args):
     cfg = {
@@ -159,9 +159,9 @@ def main():
     models = []
     for m in model_list:
         m = m.strip() # 공백 제거 ex. A00_00_U2net
-        model = load_model(m, args.param_path)
+        model_name, model = load_model(m, args.param_path)
         model = nn.DataParallel(model).to(args.device)
-        models.append(model)
+        models.append([model_name, model])
     
     # Data setting
     if args.dataset == 'CBN':
@@ -185,15 +185,13 @@ def main():
 
     # Prediction
     models_pred = []
-    for i, model in enumerate(models):
-        if i == 0: #u2net
-            u2net = True
+    for name, model in models:
+        if name == 'U2net':
             prediction, label = inference(model, args, te_loader, # Label data 
-                                          u2net, with_label=True)
+                                          u2net=True, with_label=True)
         else:
-            u2net = False
             prediction, _ = inference(model, args, te_loader, 
-                                          u2net, with_label=False)
+                                          u2net=False, with_label=False)
         models_pred.append(prediction)
 
     def Ensemble(preds, major=2):
