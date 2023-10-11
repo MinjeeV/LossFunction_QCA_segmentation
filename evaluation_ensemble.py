@@ -26,6 +26,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('exp_name', type=str, default='TEST00_00',
                        help='Experiment will be saved as this name')
+    parser.add_argument('--model_list', type=str, 
+                       default='A00_00_U2net, A00_01_UnetPP, A00_01_UnetPP',
+                       help='Experiment will be saved as this name')
     parser.add_argument('--param_path', type=str, default='./param/',
                        help='The model parameter will be saved at this dir.')
     parser.add_argument('--project', type=str, default='QCA_segmentation',
@@ -120,6 +123,23 @@ def inference(model, args, data_loader, u2net=False,
         list2arr(label)
     return prediction, label
 
+def load_model(m, param_path):
+    aux_params = dict(pooling='avg', dropout=0.5, classes=3)
+    model_name = m[7:]
+    if model_name == 'U2net':
+        model = U2net.U2NET_CL(1,3, aux_params=aux_params)
+    elif model_name == 'UnetPP':
+        model = smp.UnetPlusPlus('efficientnet-b4',
+                     activation = 'sigmoid', aux_params=aux_params,
+                     in_channels=1, classes=3)
+    elif model_name == 'Deeplab':
+        model = smp.DeepLabV3Plus('efficientnet-b4',
+                     activation = 'sigmoid', aux_params=aux_params,
+                     in_channels=1, classes=3)
+    
+    model.load_state_dict(torch.load(param_path+m))
+    return model
+
 def make_config(args):
     cfg = {
         'experiment': args.exp_name,
@@ -134,27 +154,14 @@ def main():
     wandb.login()
     
     # Model setting
-    aux_params = dict(pooling='avg',
-                      dropout=0.5,
-                      classes=3)
     args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                               
-    model1 = U2net.U2NET_CL(1,3, aux_params=aux_params)
-    model1.load_state_dict(torch.load(args.param_path+'A00_00'))
-    model1 = nn.DataParallel(model1).to(args.device)
-    
-    model2 = smp.UnetPlusPlus('efficientnet-b4',
-                     activation = 'sigmoid', aux_params=aux_params,
-                     in_channels=1, classes=3)
-    model2.load_state_dict(torch.load(args.param_path+'A00_01'))
-    model2 = nn.DataParallel(model2).to(args.device)
-    
-    model3 = smp.UnetPlusPlus('efficientnet-b4',
-                     activation = 'sigmoid', aux_params=aux_params,
-                     in_channels=1, classes=3)
-    model3.load_state_dict(torch.load(args.param_path+'A00_01'))
-    model3 = nn.DataParallel(model3).to(args.device)
-    
+    model_list = args.model_list.split(',')
+    models = []
+    for m in model_list:
+        m = m.strip() # 공백 제거 ex. A00_00_U2net
+        model = load_model(m, args.param_path)
+        model = nn.DataParallel(model).to(args.device)
+        models.append(model)
     
     # Data setting
     if args.dataset == 'CBN':
@@ -178,7 +185,7 @@ def main():
 
     # Prediction
     models_pred = []
-    for i, model in enumerate([model1, model2, model3]):
+    for i, model in enumerate(models):
         if i == 0: #u2net
             u2net = True
             prediction, label = inference(model, args, te_loader, # Label data 

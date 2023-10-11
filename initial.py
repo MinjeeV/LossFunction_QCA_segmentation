@@ -4,6 +4,7 @@ import torch.optim as optim
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
+from torch.cuda.amp import GradScaler, autocast
 
 import segmentation_models_pytorch as smp
 import albumentations as album
@@ -34,6 +35,8 @@ def parse_args():
     
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--epochs', type=int, default=400)
+    parser.add_argument('--use_fp16', type=int, default=0,
+                help='Use mixed precision method: set a number of iters_to_accumulate')
     
     args = parser.parse_args()
     return args
@@ -98,8 +101,12 @@ class QCAdataset(Dataset):
         return sample
 
 def train_model(model, args, tr_loader, val_loader, epochs, param_path):
-    run = wandb.init(project=args.project, name=args.param_name+'_'+args.model,
+    run = wandb.init(project=args.project, name=args.param_name,
                      job_type=args.dataset+'_train', config=args.config)
+    
+    if args.use_fp16:
+        scaler = GradScaler()
+        iters_to_accumulate = args.use_fp16
     
     total = len(tr_loader.dataset)
     print('total # of train data:', total)
@@ -121,16 +128,31 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
             _mask = _mask.float().to(args.device)
             _cl = _cl.long().to(args.device)
             
-            _out = model(_img)
-            loss_DICE = args.criterion(_out[0], _mask)
-            loss_CE = args.criterion_cl(_out[1], _cl)
-            sum_loss_DICE += loss_DICE.item()
-            sum_loss_CE += loss_CE.item()
+            if args.use_fp16:
+                with autocast():
+                    _out = model(_img)
+                    loss_DICE = args.criterion(_out[0], _mask)
+                    loss_CE = args.criterion_cl(_out[1], _cl)    
+                    loss = (loss_DICE + 0.1*loss_CE)/iters_to_accumulate
+                
+                scaler.scale(loss).backward()
+                if (i+1) % iters_to_accumulate == 0:
+                    scaler.unscale_(args.optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+                    scaler.step(args.optimizer)
+                    scaler.update()
+                    args.optimizer.zero_grad()
+            else:
+                _out = model(_img)
+                loss_DICE = args.criterion(_out[0], _mask)
+                loss_CE = args.criterion_cl(_out[1], _cl)
+                sum_loss_DICE += loss_DICE.item()
+                sum_loss_CE += loss_CE.item()
 
-            loss = (loss_DICE + 0.1*loss_CE)
-            loss.backward()
-            args.optimizer.step()
-            args.optimizer.zero_grad()
+                loss = (loss_DICE + 0.1*loss_CE)
+                loss.backward()
+                args.optimizer.step()
+                args.optimizer.zero_grad()
             
         score, f1, _, _acc = validation(model, args, val_loader)
         
@@ -268,9 +290,9 @@ def main():
     
     train_loader = DataLoader(tr_set, batch_size = args.batch_size,
                               shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size = args.batch_size*2,
+    val_loader = DataLoader(val_set, batch_size = args.batch_size,
                             shuffle=False, num_workers=4)
-    te_loader = DataLoader(te_set, batch_size= args.batch_size*2,
+    te_loader = DataLoader(te_set, batch_size= args.batch_size,
                        shuffle=False, num_workers=4)
     
     param_path = args.param_path + args.param_name
@@ -295,7 +317,7 @@ def main():
     avg_score, f1, std, _acc = validation(model, args, te_loader)
     
     # Results
-    run = wandb.init(project=args.project, name=args.param_name+'_'+args.model,
+    run = wandb.init(project=args.project, name=args.param_name,
                      job_type='CBN_test', config=args.config)
     results = wandb.Table(columns = ['dice_m1', 'dice_m2', 'dice_m3', 'avg', 'acc'])
     results.add_data(f1[0], f1[1], f1[2], avg_score, _acc)
@@ -320,11 +342,11 @@ def main():
         te_set += meta_file["fold_idx"][i]
 
     te_set = QCAdataset(te_set, meta_file['meta'], dataset='CUH')     
-    te_loader = DataLoader(te_set, batch_size= args.batch_size*2,
+    te_loader = DataLoader(te_set, batch_size= args.batch_size,
                        shuffle=False, num_workers=4)
     
     avg_score, f1, std, _acc = validation(model, args, te_loader)
-    run = wandb.init(project=args.project, name=args.param_name+'_'+args.model,
+    run = wandb.init(project=args.project, name=args.param_name,
                      job_type='CUH_test', config=args.config)
     results = wandb.Table(columns = ['dice_m1', 'dice_m2', 'dice_m3', 'avg', 'acc'])
     results.add_data(f1[0], f1[1], f1[2], avg_score, _acc)
