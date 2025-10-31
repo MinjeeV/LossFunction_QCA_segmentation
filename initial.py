@@ -1,27 +1,38 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.transforms as T
+import torchvision.transforms.functional as F
+from torchvision.transforms.v2 import GaussianNoise
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch import amp
 
 import segmentation_models_pytorch as smp
 import albumentations as album
-import U2net
 
-import wandb
 import utils as U
 
+import U2net
 import cv2
 import numpy as np
 import time, os
 import json
 import argparse
 
+from clDice.cldice_loss.pytorch.cldice import soft_dice_cldice, soft_cldice 
+
+
+def to_float32(x):
+    """Convert numpy array to float32 dtype"""
+    return x.astype(np.float32)
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('param_name', type=str, default='TEST00_00',
+    
+    parser.add_argument('--param_name', type=str, default='TEST00_01',
                        help='The model parameter will be saved as this name.')
     parser.add_argument('--param_path', type=str, default='./param/',
                        help='The model parameter will be saved at this path.')
@@ -31,12 +42,20 @@ def parse_args():
     parser.add_argument('--model', choices=['U2net', 'Deeplab', 'UnetPP'],
                         default='U2net')
     parser.add_argument('--dataset', type=str, default='CBN')
-    parser.add_argument('--fold', type=int, default= 0)
+    parser.add_argument('--fold', type=int, default=0)
     
-    parser.add_argument('--batch_size', type=int, default=12)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--use_fp16', type=int, default=0,
                 help='Use mixed precision method: set a number of iters_to_accumulate')
+    
+    # clDice 관련 파라미터
+    parser.add_argument('--use_cldice', action='store_true',
+                       help='Use clDice loss for topology preservation')
+    parser.add_argument('--alpha', type=float, default=0.5,
+                       help='Weight for clDice loss (0.0=only dice, 1.0=only cldice)')
+    parser.add_argument('--skel_iter', type=int, default=10,
+                       help='Number of iterations for soft skeletonization')
     
     args = parser.parse_args()
     return args
@@ -46,244 +65,329 @@ def select_aug(aug_list):
     for i in aug_list:
         if i == 'Translation':
             transforms.append(
-                album.ShiftScaleRotate(scale_limit=(-0.2,0),
-                                      rotate_limit=20,
-                                      shift_limit=0.1,
-                                      border_mode=0, value=[0.3,0.4,0.5],
-                                      p=1))
+                album.Affine(
+                    scale=(0.8, 1.0),
+                    rotate=(-20, 20),
+                    translate_percent=(0.0, 0.1),
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=(77, 102, 127),
+                    p=1
+                )
+            )
+
         elif i == 'Contrast':
             transforms.append(album.RandomContrast(limit=0.4, p=0.5))
-        
+
         elif i == 'GaussNoise':
-            transforms.append(album.GaussNoise(var_limit=(0, 0.01), p=0.5))
+            transforms.append(album.GaussNoise(std_range=(0, 0.1), p=0.5))
+
         elif i == 'GaussBlur':
             transforms.append(album.GaussianBlur(blur_limit=5, p=0.2))
+
         elif i == 'Gamma':
             transforms.append(album.RandomGamma(gamma_limit=(50,150), p=0.2))
+
         else:
             print('name error')
-            return
-            
-    return album.Compose(transforms = transforms)
+            return None
+
+    return album.Compose(transforms=transforms)
 
 class QCAdataset(Dataset):
     def __init__(self, idxs, meta, augment=False, dataset='CBN'):
-        self.idxs = idxs # tr, val, te idxs
+        self.idxs = idxs
         self.meta = meta
-        self.base_path = '/CBN/Angiography/1. QCA/10. DatasetForDL/'+dataset
+        self.base_path = '/CBN/yi/QCA/10. DatasetForDL/'+dataset
         self.augment = augment
+              
     def __len__(self):
         return len(self.idxs)
+    
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        
+    
         _path = os.path.join(self.base_path, 
                                 'Input', 'png', 
-                             self.meta[self.idxs[idx]]['id']+'.png') # fixed
+                             self.meta[self.idxs[idx]]['id']+'.png')
         img = cv2.imread(_path)[:,:,0]
-        
+
         _path = os.path.join(self.base_path, 
                                 'Mask', 'extracted', 
-                             self.meta[self.idxs[idx]]['id']+'.png')
-        mask = cv2.imread(_path)    
-            
-        mm = np.min(img)
-        sample = {'image':(img-mm)/(np.max(img)-mm),
-                  'mask':mask/255}
-
-        if self.augment:
-            sample = self.augment(**sample)
+                            self.meta[self.idxs[idx]]['id']+'.png')
+        mask = cv2.imread(_path)
         
-        sample ={'image': sample['image'],
-                 'mask': np.transpose(sample['mask'], (2,0,1)),
-                 'class': self.meta[self.idxs[idx]]['class']}
+        # 채널 3번(index 2)만 선택
+        mask = mask[:, :, 2:3]  # (H, W, 1)
+
+        mm = np.min(img)
+        image = to_float32((img - mm) / (np.max(img) - mm))
+        mask  = to_float32(mask / 255)
+        
+        if self.augment:
+            augmented = self.augment(image=image, mask=mask)
+            image, mask = augmented['image'], augmented['mask']
+        else:
+            image, mask = image, mask
+
+        sample = {
+            'image': image,
+            'mask': np.transpose(mask, (2,0,1)),  # (H,W,1) → (1,H,W)
+        }
         return sample
 
+def validation(model, args, data_loader, thres_prop=False):
+    dice_scores = []
+    cl_dice_scores = []
+    model.eval()
+    
+    for i, data in enumerate(data_loader):
+        _img, _mask = data['image'], data['mask']
+        _img = _img.float().to(args.device)
+        _img = _img.unsqueeze(1)
+
+        _mask_np = _mask.cpu().detach().numpy()
+
+        with torch.no_grad():
+            _out = model(_img)
+            pred_seg = _out
+                    
+        if args.model == 'U2net':
+            pred_seg = pred_seg[0]
+        
+        # 디버깅: 첫 배치에서 shape 확인
+        if i == 0:
+            print(f"[Validation Debug]")
+            print(f"  pred_seg before threshold - shape: {pred_seg.shape}, min: {pred_seg.min():.4f}, max: {pred_seg.max():.4f}")
+            print(f"  _mask shape: {_mask_np.shape}, unique values: {np.unique(_mask_np)}")
+        
+        # Dice score 계산 (기존)
+        pred_binary = (pred_seg>0.5).type(torch.uint8).cpu().detach().numpy()
+        
+        if i == 0:
+            print(f"  pred_binary shape: {pred_binary.shape}, unique values: {np.unique(pred_binary)}")
+            
+        if thres_prop != False:
+            pred_binary = U.post_processing(pred_binary, thres_prop=thres_prop)
+            
+        # 단일 채널 Dice score 계산
+        Score = U.calculate_score(_mask_np[:,0], pred_binary[:,0], 'Dice')
+        dice_scores.extend(Score)
+        
+        # clDice score 계산 (topology 평가)
+        if hasattr(args, 'use_cldice') and args.use_cldice:
+            _mask_tensor = _mask.float().to(args.device)
+            with torch.no_grad():
+                # clDice loss는 낮을수록 좋으므로, 1에서 빼서 score로 변환
+                cl_loss = args.criterion_cl(pred_seg, _mask_tensor).item()
+                cl_score = 1.0 - cl_loss
+                cl_dice_scores.append(cl_score)
+        
+    avg_dice = np.mean(dice_scores)
+    std_dice = np.std(dice_scores)
+    
+    # Combined metric 계산
+    if cl_dice_scores and hasattr(args, 'use_cldice') and args.use_cldice:
+        avg_cldice = np.mean(cl_dice_scores)
+        # 0.5 * Dice + 0.5 * clDice
+        combined_score = 0.5 * avg_dice + 0.5 * avg_cldice
+        
+        print(f"  avg_dice: {avg_dice:.4f}, avg_cldice: {avg_cldice:.4f}, combined: {combined_score:.4f}")
+        
+        return combined_score, std_dice, avg_dice, avg_cldice
+    else:
+        return avg_dice, std_dice, avg_dice, 0.0
+
 def train_model(model, args, tr_loader, val_loader, epochs, param_path):
-    run = wandb.init(project=args.project, name=args.param_name,
-                     job_type=args.dataset+'_train', config=args.config)
     
     if args.use_fp16:
         scaler = GradScaler()
         iters_to_accumulate = args.use_fp16
     
     total = len(tr_loader.dataset)
-    print('total # of train data:', total)
-    print(args.config)
     tr_iter = len(tr_loader)
     best_score = 0
 
     for epoch in range(epochs):
         start_time = time.time()
         sum_loss_DICE = 0
-        sum_loss_CE = 0
+        sum_loss_CL = 0
+        sum_loss_total = 0
+        
         model.train()
+        
         for i, data in enumerate(tr_loader):
-            # set model input
-            _img, _mask, _cl = data['image'], data['mask'], data['class']
+            _img, _mask = data['image'], data['mask']
             _img = _img.float().to(args.device)
             _img = _img.unsqueeze(1)
         
             _mask = _mask.float().to(args.device)
-            _cl = _cl.long().to(args.device)
             
             if args.use_fp16:
-                with autocast():
+                with amp.autocast("cuda"):
                     _out = model(_img)
-                    loss_DICE = args.criterion(_out[0], _mask)
-                    loss_CE = args.criterion_cl(_out[1], _cl)    
-                    loss = (loss_DICE + 0.1*loss_CE)/iters_to_accumulate
-                
+                    
+                    loss_DICE = args.criterion(_out, _mask)
+                    
+                    if args.use_cldice:
+                        # U2net의 경우 main output만 사용
+                        main_output = _out[0] if (args.model == 'U2net' and isinstance(_out, (tuple, list))) else _out
+                        loss_CL = args.criterion_cl(main_output, _mask)
+                        loss = (loss_DICE * 0.8 + loss_CL * 0.2) / iters_to_accumulate
+                    else:
+                        loss = loss_DICE / iters_to_accumulate
+                    
                 scaler.scale(loss).backward()
+                
                 if (i+1) % iters_to_accumulate == 0:
                     scaler.unscale_(args.optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                     scaler.step(args.optimizer)
                     scaler.update()
                     args.optimizer.zero_grad()
-            else:
-                _out = model(_img)
-                loss_DICE = args.criterion(_out[0], _mask)
-                loss_CE = args.criterion_cl(_out[1], _cl)
+                
+                # Loss 누적
                 sum_loss_DICE += loss_DICE.item()
-                sum_loss_CE += loss_CE.item()
+                if args.use_cldice:
+                    sum_loss_CL += loss_CL.item()
+                    sum_loss_total += (loss_DICE.item() * 0.8 + loss_CL.item() * 0.2) 
+                else:
+                    sum_loss_total += loss_DICE.item() 
+                
+            else:
+                _out = model(_img) 
 
-                loss = (loss_DICE + 0.1*loss_CE)
+                loss_DICE = args.criterion(_out, _mask)
+
+                # clDice 사용 시
+                if args.use_cldice:
+                    
+                    main_output = _out[0] if (args.model == 'U2net' and isinstance(_out, (tuple, list))) else _out
+                    loss_CL = args.criterion_cl(main_output, _mask)
+                    loss = (loss_DICE * 0.8 + loss_CL * 0.2)
+                    sum_loss_CL += loss_CL.item()
+                    
+                else:
+                    loss = loss_DICE
+
                 loss.backward()
+
+                sum_loss_DICE += loss_DICE.item()
+                sum_loss_total += loss.item()
+
+
                 args.optimizer.step()
                 args.optimizer.zero_grad()
-            
-        score, f1, _, _acc = validation(model, args, val_loader)
+                
+            if (i + 1) % 50 == 0:
+                if hasattr(args, 'use_cldice') and args.use_cldice:
+                    print(f"Epoch [{epoch}/{epochs-1}] Batch [{i+1}/{len(tr_loader)}] "
+                          f"Dice: {loss_DICE.item():.4f} clDice: {loss_CL.item():.4f} Total: {loss.item():.4f}")
+                else:
+                    print(f"Epoch [{epoch}/{epochs-1}] Batch [{i+1}/{len(tr_loader)}] "
+                          f"Seg: {loss_DICE.item():.4f}")
+
+        total_score, dice_std, dice_avg, cldice_avg = validation(model, args, val_loader)
         
-        if best_score < score:
-            best_score = score
+        if best_score < total_score:
+            best_score = total_score
             torch.save(model.module.state_dict(), param_path)
         
         running_loss_DICE = sum_loss_DICE/tr_iter
-        running_loss_CE = sum_loss_CE/tr_iter
+        running_loss_total = sum_loss_total/tr_iter
 
         time_elapsed = time.time() - start_time
         
-        # wandb log save
-        wandb.log({'train_loss': running_loss_DICE,
-                   'val_avg_f1': score,
-                   'val_acc': _acc,
-                   'val_best_score': best_score,
-                   'lr': args.optimizer.param_groups[0]['lr']})
-                
-        
-        print('Epoch {}/{}'.format(epoch, epochs -1),
-              'avg_loss_DICE: %.6f' %(running_loss_DICE),
-              'avg_loss_CE: %.6f' %(running_loss_CE),
-              'accuracy: %.6f' %(_acc),
-              '| best_score: %.6f' %(best_score), 
-              '| time: %.2f'%(time_elapsed))
-    run.finish()
-        
-def validation(model, args, data_loader, thres_prop=False):
-    score_M1 = []
-    score_M2 = []
-    score_M3 = []
-    running_corrects = 0.0
-    model.eval()
-    for i, data in enumerate(data_loader):
-        # set model input
-        _img, _mask, _cl = data['image'], data['mask'], data['class']
-        _img = _img.float().to(args.device)
-        _img = _img.unsqueeze(1)
+        if hasattr(args, 'use_cldice') and args.use_cldice:
+            running_loss_CL = sum_loss_CL/tr_iter
+            print('Epoch {}/{}'.format(epoch, epochs -1),
+                  'avg_loss_DICE: %.6f' %(running_loss_DICE),
+                  'avg_loss_CL: %.6f' %(running_loss_CL),
+                  'avg_loss_total: %.6f' %(running_loss_total),
+                  '| best_score: %.6f' %(best_score), 
+                  '| dice_std: %.6f' %(dice_std),
+                  '| time: %.2f'%(time_elapsed))
+        else:
+            print('Epoch {}/{}'.format(epoch, epochs -1),
+                  'avg_loss_DICE: %.6f' %(running_loss_DICE),
+                  '| best_score: %.6f' %(best_score), 
+                  '| dice_std: %.6f' %(dice_std),
+                  '| time: %.2f'%(time_elapsed))
 
-        _cl = _cl.long().to(args.device)
-        
-        _mask = _mask.cpu().detach().numpy()
-
-        with torch.no_grad():
-            _out = model(_img)
-            _, pred_cl = torch.max(_out[1], 1)
-            pred_seg = _out[0]
-            
-        running_corrects += pred_cl.eq(_cl).sum().item()
-                    
-        if args.model == 'U2net':
-            pred_seg = pred_seg[0]
-        
-        pred_seg = (pred_seg>0.5).type(torch.uint8)
-        pred_seg = pred_seg.cpu().detach().numpy()
-            
-        if thres_prop != False:
-            _out = U.post_processing(_out, thres_prop=thres_prop)
-            
-        Score1 = U.calculate_score(_mask[:,0], pred_seg[:,0],'Dice')
-        Score2 = U.calculate_score(_mask[:,1], pred_seg[:,1],'Dice')
-        Score3 = U.calculate_score(_mask[:,2], pred_seg[:,2],'Dice')
-        
-        score_M1.extend(Score1)
-        score_M2.extend(Score2)
-        score_M3.extend(Score3)
-        
-    avg_score_M1 = np.mean(score_M1)
-    avg_score_M2 = np.mean(score_M2)
-    avg_score_M3 = np.mean(score_M3)
-    
-    avg_score = np.mean([avg_score_M1, avg_score_M2, avg_score_M3])
-    
-    epoch_acc = running_corrects/len(data_loader.dataset)
-        
-    std_M1 = np.std(score_M1)
-    std_M2 = np.std(score_M2)
-    std_M3 = np.std(score_M3)
-    
-    f1 = (avg_score_M1, avg_score_M2, avg_score_M3)
-    std = (std_M1, std_M2, std_M3)
-    return avg_score, f1, std, epoch_acc
-
-def make_config(args):
-    cfg = {
-        'experiment': args.param_name,
-        'dataset': args.dataset,
-        'model': args.model,
-        'input_size': 512,
-        'batch_size': args.batch_size}
-    return cfg
 
 def main():
+    print("Clean code!")
     args = parse_args()
-    args.config = make_config(args) # for wandb
-    wandb.login()
     
-    aux_params = dict(pooling='avg',
-                      dropout=0.5,
-                      classes=3)
     if args.model == 'U2net':
-        model = U2net.U2NET_CL(1,3, aux_params=aux_params)
-        args.criterion = U.Supv_DiceLoss()
+        # 출력 채널을 1로 변경
+        model = U2net.U2NET(1, 1)
+        
+        # clDice 사용 여부에 따라 손실 함수 설정
+        if args.use_cldice:
+            # Supv_DiceLoss는 U2net의 deep supervision용
+            args.criterion = U.Supv_DiceLoss()
+            # clDice는 전경에만 적용 (exclude_background=False, 단일 채널이므로 불필요)
+            args.criterion_cl = soft_dice_cldice(
+                iter_=3, 
+                alpha=args.alpha, 
+                smooth=1., 
+                exclude_background=False
+            )
+        else:
+            args.criterion = U.Supv_DiceLoss()
+        
     elif args.model == 'UnetPP':
         model = smp.UnetPlusPlus('efficientnet-b4', encoder_weights='imagenet',
-                         activation = 'sigmoid', aux_params=aux_params,
-                         in_channels=1, classes=3)
-        args.criterion = U.DiceLoss()
+                         activation = 'sigmoid',
+                         in_channels=1, classes=1)
+        
+        if args.use_cldice:
+            args.criterion = U.DiceLoss()
+            args.criterion_cl = soft_cldice(
+                iter_=3,
+                alpha=args.alpha,
+                smooth=1.,
+                exclude_background=False
+            )
+        else:
+            args.criterion = U.DiceLoss()
+        
     elif args.model == 'Deeplab':
         model = smp.DeepLabV3Plus('efficientnet-b4', encoder_weights='imagenet',
-                         activation = 'sigmoid', aux_params=aux_params,
-                         in_channels=1, classes=3)
-        args.criterion = U.DiceLoss()
+                         activation = 'sigmoid',
+                         in_channels=1, classes=1)
+        
+        if args.use_cldice:
+            args.criterion = U.DiceLoss()
+            args.criterion_cl = soft_cldice(
+                iter_=3,
+                alpha=args.alpha,
+                smooth=1.,
+                exclude_background=False
+            )
+        else:
+            args.criterion = U.DiceLoss()
 
-    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        args.device = torch.device('cuda')
+    else:
+        import sys
+        sys.exit("CUDA is not available")
+        
     model = nn.DataParallel(model).to(args.device)
-    print(args.device)
-                             
-    args.criterion_cl = nn.CrossEntropyLoss()
+
     args.optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    
-    augment = select_aug(['Contrast', 'Translation', 'GaussNoise'])
+ 
+    augment = select_aug(['Translation', 'GaussNoise'])
     
     if args.dataset == 'CBN':                     
-        data_path = "/CBN/Angiography/1. QCA/10. DatasetForDL/CBN/meta.json"
+        data_path = "/CBN/yi/QCA/10. DatasetForDL/CBN/meta.json"
         with open(data_path) as json_file:
             meta_file = json.load(json_file)
     
     tr_set, val_set, te_set = U.select_fold(args.fold, meta_file["fold_idx"])
+    
     tr_set = QCAdataset(tr_set, meta_file['meta'], augment=augment)
     val_set = QCAdataset(val_set, meta_file['meta'])
     te_set = QCAdataset(te_set, meta_file['meta'])
@@ -296,47 +400,42 @@ def main():
                        shuffle=False, num_workers=4)
     
     param_path = args.param_path + args.param_name
+    
     # Train
     train_model(model, args, train_loader, val_loader,
                 epochs=args.epochs, param_path=param_path)
-    
-    # Test
+
+    # Testing
     if args.model == 'U2net':
-        model = U2net.U2NET_CL(1,3, aux_params=aux_params)
+        model = U2net.U2NET(1, 1)
+        
     elif args.model == 'UnetPP':
         model = smp.UnetPlusPlus('efficientnet-b4', encoder_weights='imagenet',
-                         activation = 'sigmoid', aux_params=aux_params,
-                         in_channels=1, classes=3)
+                         activation = 'sigmoid',
+                         in_channels=1, classes=1)
+        
     elif args.model == 'Deeplab':
         model = smp.DeepLabV3Plus('efficientnet-b4', encoder_weights='imagenet',
-                         activation = 'sigmoid', aux_params=aux_params,
-                         in_channels=1, classes=3)
+                         activation = 'sigmoid',
+                         in_channels=1, classes=1)
     
-    model.load_state_dict(torch.load(param_path))
+    model.load_state_dict(torch.load(param_path, weights_only=True))
     model = nn.DataParallel(model).to(args.device)
-    avg_score, f1, std, _acc = validation(model, args, te_loader)
-    
-    # Results
-    run = wandb.init(project=args.project, name=args.param_name,
-                     job_type='CBN_test', config=args.config)
-    results = wandb.Table(columns = ['dice_m1', 'dice_m2', 'dice_m3', 'avg', 'acc'])
-    results.add_data(f1[0], f1[1], f1[2], avg_score, _acc)
-    wandb.log({'Test results': results})
-    run.finish()
+    total_score, dice_std, dice_avg, cldice_avg = validation(model, args, te_loader)
     
     print('[CBN results] ===========================================')
-    print('classification accuracy:', _acc)
-    print('avg_score: %.6f' %(avg_score))
-    print('score_m1: %.6f' %(f1[0]),'std_m1: %.6f' %(std[0]))
-    print('score_m2: %.6f' %(f1[1]),'std_m2: %.6f' %(std[1]))
-    print('score_m3: %.6f' %(f1[2]),'std_m3: %.6f' %(std[2]))
+    print('total_score: %.6f' %(total_score))
+    print('dice_std: %.6f' %(dice_std))
+    print('dice_avg: %.6f' %(dice_avg))
+    print('cldice_avg: %.6f' %(cldice_avg))
     print('=====================================================')
+
     
-    # CUH Results                               
-    data_path = "/CBN/Angiography/1. QCA/10. DatasetForDL/CUH/meta.json"
+    # CUH Results    
+    data_path = "/CBN/yi/QCA/10. DatasetForDL/CUH/meta.json"
     with open(data_path) as json_file:
         meta_file = json.load(json_file)
-    # 모든 fold 합쳐서 prediction
+    
     te_set = []
     for i in range(5):
         te_set += meta_file["fold_idx"][i]
@@ -345,24 +444,14 @@ def main():
     te_loader = DataLoader(te_set, batch_size= args.batch_size,
                        shuffle=False, num_workers=4)
     
-    avg_score, f1, std, _acc = validation(model, args, te_loader)
-    run = wandb.init(project=args.project, name=args.param_name,
-                     job_type='CUH_test', config=args.config)
-    results = wandb.Table(columns = ['dice_m1', 'dice_m2', 'dice_m3', 'avg', 'acc'])
-    results.add_data(f1[0], f1[1], f1[2], avg_score, _acc)
-    wandb.log({'Test results': results})
-    run.finish()
+    total_score, dice_std, dice_avg, cldice_avg = validation(model, args, te_loader)
+
     print('[CUH results] ===========================================')
-    print('classification accuracy:', _acc)
-    print('avg_score: %.6f' %(avg_score))
-    print('score_m1: %.6f' %(f1[0]),'std_m1: %.6f' %(std[0]))
-    print('score_m2: %.6f' %(f1[1]),'std_m2: %.6f' %(std[1]))
-    print('score_m3: %.6f' %(f1[2]),'std_m3: %.6f' %(std[2]))
+    print('total_score: %.6f' %(total_score))
+    print('dice_std: %.6f' %(dice_std))
+    print('dice_avg: %.6f' %(dice_avg))
+    print('cldice_avg: %.6f' %(cldice_avg))
     print('=====================================================')
     
-        
 if __name__ == '__main__':
     main()
-    
-    
-    
