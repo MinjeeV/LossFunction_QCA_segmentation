@@ -572,6 +572,7 @@ class U2NET_CL(nn.Module):
     def __init__(self, in_ch=3,out_ch=1, aux_params=None):
         super(U2NET_CL,self).__init__()
 
+        #incoder
         self.stage1 = RSU7(in_ch,32,64)
         self.pool12 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
 
@@ -587,10 +588,11 @@ class U2NET_CL(nn.Module):
         self.stage5 = RSU4F(512,256,512)
         self.pool56 = nn.MaxPool2d(2,stride=2,ceil_mode=True)
 
-        self.stage6 = RSU4F(512,256,512)
+        #hx6 
+        self.stage6 = RSU4F(512,256,512)    #lowest resolution, richest semantic/global features
         
         # classification head
-        self.classification_head = ClassificationHead(
+        self.classification_head = ClassificationHead(  # predict whole-image class (e.g., cat vs dog) from hx6
             in_channels=512, **aux_params) 
         
         # decoder

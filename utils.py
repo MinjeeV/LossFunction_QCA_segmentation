@@ -163,11 +163,11 @@ class Supv_DiceLoss(nn.Module): # U2Net supervision dice loss
     def __init__(self, n=7):
         super(Supv_DiceLoss, self).__init__()
         self.n = n
+        self.dice = DiceLoss() #for memory efficiency
     def forward(self, predict, target):
-        dice = DiceLoss()
         total_loss = 0
         for i in range(self.n):
-            total_loss += dice(predict[i], target)
+            total_loss += self.dice(predict[i], target)
         return total_loss
         
 '''
