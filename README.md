@@ -1,5 +1,3 @@
-# clDice github README
-
 # Loss Function Experiments for QCA Segmentation
 
 This repository applies clDice loss function to vessel segmentation experiments in coronary angiography (QCA) images.
