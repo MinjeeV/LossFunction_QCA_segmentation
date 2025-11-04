@@ -198,6 +198,21 @@ def validation(model, args, data_loader, thres_prop=False):
     else:
         return avg_dice, std_dice, avg_dice, 0.0
 
+def get_loss_weights(epoch, total_epochs):
+    """동적 loss weight 계산"""
+    if epoch <= 50:
+        # Epoch 0~50: (0.7, 0.3) 고정
+        alpha = 0.7
+        beta = 0.3
+    else:
+        # Epoch 51~90: 0.7->0.1, 0.3->0.9 (40 epoch에 걸쳐 변화)
+        progress = min((epoch - 50) / 40, 1.0)
+        alpha = 0.7 - 0.6 * progress  # 0.7 -> 0.1
+        beta = 0.3 + 0.6 * progress   # 0.3 -> 0.9
+    
+    return alpha, beta
+
+
 def train_model(model, args, tr_loader, val_loader, epochs, param_path):
     
     if args.use_fp16:
@@ -213,6 +228,10 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
         sum_loss_DICE = 0
         sum_loss_CL = 0
         sum_loss_total = 0
+        
+        # 동적 loss weight 계산
+        if args.use_cldice:
+            alpha, beta = get_loss_weights(epoch, epochs)
         
         model.train()
         
@@ -233,7 +252,7 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
                         # U2net의 경우 main output만 사용
                         main_output = _out[0] if (args.model == 'U2net' and isinstance(_out, (tuple, list))) else _out
                         loss_CL = args.criterion_cl(main_output, _mask)
-                        loss = (loss_DICE * 0.8 + loss_CL * 0.2) / iters_to_accumulate
+                        loss = (loss_DICE * alpha + loss_CL * beta) / iters_to_accumulate
                     else:
                         loss = loss_DICE / iters_to_accumulate
                     
@@ -250,7 +269,7 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
                 sum_loss_DICE += loss_DICE.item()
                 if args.use_cldice:
                     sum_loss_CL += loss_CL.item()
-                    sum_loss_total += (loss_DICE.item() * 0.8 + loss_CL.item() * 0.2) 
+                    sum_loss_total += (loss_DICE.item() * alpha + loss_CL.item() * beta) 
                 else:
                     sum_loss_total += loss_DICE.item() 
                 
@@ -264,7 +283,7 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
                     
                     main_output = _out[0] if (args.model == 'U2net' and isinstance(_out, (tuple, list))) else _out
                     loss_CL = args.criterion_cl(main_output, _mask)
-                    loss = (loss_DICE * 0.8 + loss_CL * 0.2)
+                    loss = (loss_DICE * alpha + loss_CL * beta)
                     sum_loss_CL += loss_CL.item()
                     
                 else:
@@ -275,17 +294,17 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
                 sum_loss_DICE += loss_DICE.item()
                 sum_loss_total += loss.item()
 
-
                 args.optimizer.step()
                 args.optimizer.zero_grad()
                 
             if (i + 1) % 50 == 0:
                 if hasattr(args, 'use_cldice') and args.use_cldice:
                     print(f"Epoch [{epoch}/{epochs-1}] Batch [{i+1}/{len(tr_loader)}] "
-                          f"Dice: {loss_DICE.item():.4f} clDice: {loss_CL.item():.4f} Total: {loss.item():.4f}")
+                          f"Dice: {loss_DICE.item():.4f} clDice: {loss_CL.item():.4f} "
+                          f"Total: {loss.item():.4f} (α={alpha:.2f}, β={beta:.2f})")
                 else:
                     print(f"Epoch [{epoch}/{epochs-1}] Batch [{i+1}/{len(tr_loader)}] "
-                          f"Seg: {loss_DICE.item():.4f}")
+                          f"Seg: {loss_DICE.item():.4f} (α={alpha:.2f}, β={beta:.2f})")
 
         total_score, dice_std, dice_avg, cldice_avg = validation(model, args, val_loader)
         
@@ -304,6 +323,7 @@ def train_model(model, args, tr_loader, val_loader, epochs, param_path):
                   'avg_loss_DICE: %.6f' %(running_loss_DICE),
                   'avg_loss_CL: %.6f' %(running_loss_CL),
                   'avg_loss_total: %.6f' %(running_loss_total),
+                  'α: %.2f' %(alpha), 'β: %.2f' %(beta),
                   '| best_score: %.6f' %(best_score), 
                   '| dice_std: %.6f' %(dice_std),
                   '| time: %.2f'%(time_elapsed))
